@@ -18,6 +18,7 @@ namespace files {
 	bool delete_directory(const char* string);
 
 	std::string load_binary(const char* filepath);
+	std::string load_binary(const wchar_t* filepath);
 
 	bool write_binary(const char* filepath, const char* contents, size_t size);
 }

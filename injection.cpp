@@ -15,16 +15,16 @@ namespace injection {
 			return OpenProcess(flags, false, process_id);
 		}
 
-		int inject(HANDLE process_handle, const char* dll_path) {
-			void* dll_path_address = VirtualAllocEx(process_handle, NULL, strlen(dll_path) + 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		int inject(HANDLE process_handle, const wchar_t* dll_path) {
+			void* dll_path_address = VirtualAllocEx(process_handle, NULL, sizeof(wchar_t) * (wcslen(dll_path) + 1), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 			if (!dll_path_address)
 				return -1;
 
 			size_t bytes_written;
-			if (!WriteProcessMemory(process_handle, dll_path_address, dll_path, strlen(dll_path) + 1, &bytes_written))
+			if (!WriteProcessMemory(process_handle, dll_path_address, dll_path, sizeof(wchar_t) * (wcslen(dll_path) + 1), &bytes_written))
 				return -2;
 
-			void* loadlibrary = GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+			void* loadlibrary = GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW");
 			HANDLE thread_handle = CreateRemoteThread(process_handle, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(loadlibrary), dll_path_address, 0, NULL);
 			if (!thread_handle)
 				return -3;
@@ -34,7 +34,7 @@ namespace injection {
 			return 1;
 		}
 
-		int inject(HANDLE process_handle, std::string dll_path) {
+		int inject(HANDLE process_handle, std::wstring dll_path) {
 			return inject(process_handle, dll_path.c_str());
 		}
 	}
@@ -42,8 +42,8 @@ namespace injection {
 	// hook
 
 	namespace hook {
-		int inject(DWORD thread_id, const char* dll_path, const char* export_name) {
-			HMODULE dll = LoadLibraryExA(dll_path, NULL, DONT_RESOLVE_DLL_REFERENCES);
+		int inject(DWORD thread_id, const wchar_t* dll_path, const char* export_name) {
+			HMODULE dll = LoadLibraryExW(dll_path, NULL, DONT_RESOLVE_DLL_REFERENCES);
 			if (!dll)
 				return -1;
 
@@ -66,7 +66,7 @@ namespace injection {
 			return 1;
 		}
 
-		int inject(DWORD thread_id, std::string dll_path, std::string export_name) {
+		int inject(DWORD thread_id, std::wstring dll_path, std::string export_name) {
 			return inject(thread_id, dll_path.c_str(), export_name.c_str());
 		}
 	}
@@ -114,7 +114,8 @@ namespace injection {
 			return base + section->PointerToRawData + (rva - section->VirtualAddress);
 		}
 
-		bool resolve_imports(char* base, IMAGE_NT_HEADERS* nt) {
+		template <class F>
+		bool resolve_imports(char* base, IMAGE_NT_HEADERS* nt, F get_proc_address) {
 			auto rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
 			if (!rva)
 				return true;
@@ -128,13 +129,9 @@ namespace injection {
 				if (!module_name)
 					break;
 
-				auto module = LoadLibraryA(module_name);
-				if (!module)
-					return false;
-
 				for (auto thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(translate_raw(base, nt, import->FirstThunk)); thunk->u1.AddressOfData; ++thunk) {
 					auto by_name = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(translate_raw(base, nt, static_cast<DWORD>(thunk->u1.AddressOfData)));
-					thunk->u1.Function = reinterpret_cast<UINT_PTR>(GetProcAddress(module, by_name->Name));
+					thunk->u1.Function = get_proc_address(module_name, by_name->Name);
 				}
 			}
 
@@ -169,10 +166,10 @@ namespace injection {
 			}
 		}
 
-		int inject(DWORD process_id, DWORD thread_id, const char* dll_path) {
+		int inject(DWORD process_id, DWORD thread_id, const wchar_t* dll_path) {
 			auto buffer = files::load_binary(dll_path);
 			auto dll = new char[buffer.length()]; memcpy(dll, buffer.data(), buffer.length());
-			auto module = LoadLibraryExA(dll_path, NULL, DONT_RESOLVE_DLL_REFERENCES);
+			auto module = LoadLibraryExW(dll_path, NULL, DONT_RESOLVE_DLL_REFERENCES);
 
 			IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(dll);
 			if (dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -191,10 +188,8 @@ namespace injection {
 				return -3;
 			}
 
-			printf("allocate image: %p\n", image);
-
 			// resolve imports
-			if (!resolve_imports(dll, nt))
+			if (!resolve_imports(dll, nt, [](const char* module_name, const char* function_name) { return reinterpret_cast<uint64_t>(GetProcAddress(LoadLibraryA(module_name), function_name)); }))
 				return -4;
 
 			// resolve relocations
@@ -203,15 +198,43 @@ namespace injection {
 			// copy headers to image
 			WriteProcessMemory(process, image, dll, nt->OptionalHeader.SizeOfHeaders, NULL);
 
-			printf("wrote headers to image\n");
-
 			// copy sections to image
 			IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
 			for (size_t i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-				printf("section[%i]: %s\n", i, section[i].Name);
 				WriteProcessMemory(process, reinterpret_cast<void*>(reinterpret_cast<uint64_t>(image) + section[i].VirtualAddress),
 					reinterpret_cast<void*>(reinterpret_cast<uint64_t>(dll) + section[i].PointerToRawData), section[i].SizeOfRawData, NULL);
 			}
+
+			/* initialize security cookie */
+
+			auto init_cookie = [&]() {
+				if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress)
+					return 1;
+				
+				auto load_cfg = reinterpret_cast<IMAGE_LOAD_CONFIG_DIRECTORY64*>(reinterpret_cast<uint64_t>(dll) + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress);
+				uint64_t security_cookie = load_cfg->SecurityCookie;
+				if (!security_cookie)
+					return 1;
+
+				// taken from blackbone, credits to darth
+				FILETIME sys_time = {};
+				LARGE_INTEGER performance_count = { {} };
+
+				GetSystemTimeAsFileTime(&sys_time);
+				QueryPerformanceCounter(&performance_count);
+
+				uint64_t cookie = process_id ^ thread_id ^ reinterpret_cast<uintptr_t>(&security_cookie);
+
+				cookie ^= *reinterpret_cast<uint64_t*>(&sys_time);
+				cookie ^= (performance_count.QuadPart << 32) ^ performance_count.QuadPart;
+				cookie &= 0xFFFFFFFFFFFF;
+				if (cookie == 0x2B992DDFA232)
+					cookie++;
+
+				return WriteProcessMemory(process, reinterpret_cast<void*>(reinterpret_cast<uint64_t>(image) + (cookie - reinterpret_cast<uint64_t>(dll))), &cookie, sizeof(void*), NULL);
+			};
+
+			init_cookie();
 
 			/* execute image */
 
@@ -226,7 +249,8 @@ namespace injection {
 			void* reason = reinterpret_cast<void*>(DLL_PROCESS_ATTACH);
 			memcpy(shell + 19, &reason, sizeof(void*));
 
-			void* entry_point = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(image) + (reinterpret_cast<char*>(GetProcAddress(module, "DllMain")) - reinterpret_cast<char*>(module)));
+			//void* entry_point = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(image) + (reinterpret_cast<char*>(GetProcAddress(module, "DllMain")) - reinterpret_cast<char*>(module)));
+			void* entry_point = reinterpret_cast<void*>(reinterpret_cast<uint64_t>(image) + nt->OptionalHeader.AddressOfEntryPoint);
 			memcpy(shell + 29, &entry_point, sizeof(void*));
 
 			CONTEXT ctx = {}; ctx.ContextFlags = CONTEXT_FULL;
@@ -236,17 +260,12 @@ namespace injection {
 				return -6;
 			}
 
-			printf("got ctx & suspended thread | rip: %p\n", ctx.Rip);
-
 			memcpy(shell + 41, &ctx.Rip, sizeof(void*));
 			if (!WriteProcessMemory(process, loader, shell, sizeof(thread_hijack_shell), NULL)) {
 				VirtualFreeEx(process, image, NULL, MEM_RELEASE); VirtualFreeEx(process, loader, NULL, MEM_RELEASE);
 				CloseHandle(process); CloseHandle(thread);
 				return -7;
 			}
-
-			printf("wrote shell: %p\n", loader);
-			system("pause");
 
 			ctx.Rip = reinterpret_cast<uint64_t>(loader);
 			if (!SetThreadContext(thread, &ctx) || ResumeThread(thread) == -1) {
@@ -255,12 +274,10 @@ namespace injection {
 				return -8;
 			}
 
-			printf("set thread context & resume'd thread\n");
-
 			return 1;
 		}
 
-		int inject(DWORD process_id, DWORD thread_id, std::string dll_path) {
+		int inject(DWORD process_id, DWORD thread_id, std::wstring dll_path) {
 			return inject(process_id, thread_id, dll_path.c_str());
 		}
 	}
